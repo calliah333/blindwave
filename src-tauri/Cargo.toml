@@ -1,6 +1,6 @@
 [package]
 name = "blindwave"
-version = "0.1.0"
+version = "0.1.1"
 description = "A blind music preference tester"
 authors = ["Blindwave"]
 edition = "2021"

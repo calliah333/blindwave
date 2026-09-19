@@ -4,6 +4,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import './styles.css';
 
 const AUDIO_EXTENSIONS = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'opus', 'aiff', 'ape', 'wma'];
+const EXCERPT_SECONDS = 15;
 const saved = JSON.parse(localStorage.getItem('blindwave-settings') || '{}');
 
 const state = {
@@ -16,13 +17,21 @@ const state = {
   albumGain: saved.albumGain === true,
   ffplayPath: saved.ffplayPath || '',
   ffplay: { available: false, executable: '' },
+  commonDuration: 0,
+  rounds: [],
   currentTrial: 0,
   choices: [],
+  heard: [],
   playing: null,
+  playbackOffset: 0,
+  playbackStartedAt: null,
+  preparing: false,
+  revealOnNextChoice: false,
   error: '',
 };
 
 const app = document.querySelector('#app');
+let playbackTimer = null;
 
 function filename(path) {
   return path?.split(/[\\/]/).pop() || 'Choose a music file';
@@ -88,18 +97,18 @@ function toggleSetting(id, label, description, checked, disabled = false) {
 }
 
 function setupScreen() {
-  const canStart = state.fileA && state.fileB && state.ffplay.available;
+  const canStart = state.fileA && state.fileB && state.ffplay.available && !state.preparing;
   return `<main class="page setup-page">
     <section class="hero">
       <h1>Compare two tracks.</h1>
-      <p>Drop in two files, then listen without seeing which is which.</p>
+      <p>Drop in two versions. Each round uses a different synchronized excerpt from across the track.</p>
     </section>
 
     ${state.error ? `<div class="error-banner">${escapeHtml(state.error)}</div>` : ''}
 
     <section class="setup-grid">
-      ${fileCard('a', state.fileA, 'TRACK A')}
-      ${fileCard('b', state.fileB, 'TRACK B')}
+      ${fileCard('a', state.fileA, 'VERSION 1')}
+      ${fileCard('b', state.fileB, 'VERSION 2')}
     </section>
 
     <details class="settings-panel">
@@ -124,56 +133,88 @@ function setupScreen() {
       </div>
     </details>
 
-    <button class="button primary start-button" id="start-test" ${canStart ? '' : 'disabled'}>Start comparison ${icon('arrow')}</button>
+    <button class="button primary start-button" id="start-test" ${canStart ? '' : 'disabled'}>${state.preparing ? 'Inspecting tracks…' : `Start comparison ${icon('arrow')}`}</button>
   </main>`;
+}
+
+function formatTime(seconds) {
+  const whole = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+}
+
+function currentRound() {
+  return state.rounds[state.currentTrial];
+}
+
+function sourceForLetter(round, letter) {
+  if (letter === 'A') return round.swapped ? 'fileB' : 'fileA';
+  return round.swapped ? 'fileA' : 'fileB';
 }
 
 function playerCard(letter) {
   const active = state.playing === letter;
-  return `<div class="player-card ${active ? 'is-playing' : ''}">
+  const heard = state.heard.includes(letter);
+  const subtitle = active
+    ? 'Playing now'
+    : state.playing
+      ? 'Switch at the same position'
+      : state.playbackOffset > 0
+        ? 'Resume the synced excerpt'
+        : 'Play this excerpt';
+  return `<div class="player-card ${active ? 'is-playing' : ''} ${heard ? 'has-played' : ''}">
     <div class="player-letter">${letter}</div>
-    <div class="player-copy"><span class="player-title">Sample ${letter}</span><span class="player-subtitle">${active ? 'Playing now' : 'Listen before deciding'}</span></div>
-    <button class="play-button ${active ? 'stop' : ''}" data-play="${letter}" aria-label="${active ? 'Stop' : 'Play'} sample ${letter}">${icon(active ? 'stop' : 'play')}</button>
+    <div class="player-copy"><span class="player-title">Sample ${letter}</span><span class="player-subtitle">${subtitle}</span></div>
+    <button class="play-button ${active ? 'stop' : ''}" data-play="${letter}" aria-label="${active ? 'Pause' : state.playing ? 'Switch to' : 'Play'} sample ${letter}">${icon(active ? 'stop' : 'play')}</button>
     <div class="playing-bars"><i></i><i></i><i></i><i></i></div>
   </div>`;
 }
 
 function testingScreen() {
-  const round = state.currentTrial + 1;
+  const roundNumber = state.currentTrial + 1;
+  const round = currentRound();
+  const canChoose = state.heard.includes('A') && state.heard.includes('B');
   return `<main class="page test-page">
     <div class="test-heading">
-      <div><div class="eyebrow">LISTEN & CHOOSE</div><h1>Which one feels better?</h1><p>Take your time. You can replay either sample as often as you like.</p></div>
-      <div class="round-count"><span>ROUND</span><strong>${String(round).padStart(2, '0')} <small>/ ${String(state.trials).padStart(2, '0')}</small></strong></div>
+      <div><div class="eyebrow">LISTEN & CHOOSE</div><h1>Which one feels better?</h1><p>Switch between A and B. Both continue from the same point in the track.</p></div>
+      <div class="round-count"><span>ROUND</span><strong>${String(roundNumber).padStart(2, '0')} <small>/ ${String(state.trials).padStart(2, '0')}</small></strong></div>
     </div>
     ${state.error ? `<div class="error-banner">${escapeHtml(state.error)}</div>` : ''}
+    <div class="excerpt-note"><strong>Synced excerpt</strong><span>${formatTime(round.start)}–${formatTime(round.start + round.length)}</span><small>New section each round</small></div>
     <div class="players">${playerCard('A')}${playerCard('B')}</div>
-    <div class="test-divider"><span>YOUR PREFERENCE</span></div>
+    <div class="test-divider"><span>${canChoose ? 'YOUR PREFERENCE' : 'LISTEN TO BOTH TO CHOOSE'}</span></div>
     <div class="preference-row">
-      <button class="preference-button" data-choice="A"><span class="preference-letter">A</span><span>I prefer A</span>${icon('arrow')}</button>
-      <button class="preference-button" data-choice="B"><span class="preference-letter">B</span><span>I prefer B</span>${icon('arrow')}</button>
+      <button class="preference-button" data-choice="A" ${canChoose ? '' : 'disabled'}><span class="preference-letter">A</span><span>I prefer A</span>${icon('arrow')}</button>
+      <button class="preference-button" data-choice="B" ${canChoose ? '' : 'disabled'}><span class="preference-letter">B</span><span>I prefer B</span>${icon('arrow')}</button>
     </div>
-    <div class="test-tip"><span>Tip</span> Use headphones if you can, and keep the volume consistent between rounds.</div>
+    <div class="early-result-row">
+      <button class="finish-button ${state.revealOnNextChoice ? 'is-armed' : ''}" id="reveal-next-choice" aria-pressed="${state.revealOnNextChoice}">
+        ${state.revealOnNextChoice ? 'Will reveal on next choice · Cancel' : 'Reveal result on next choice'}
+      </button>
+    </div>
   </main>`;
 }
 
 function resultsScreen() {
-  const a = state.choices.filter((choice) => choice === 'A').length;
-  const b = state.choices.length - a;
-  const winner = a === b ? 'It’s a tie' : `${a > b ? 'Sample A' : 'Sample B'} wins`;
-  const winnerCount = Math.max(a, b);
+  const first = state.choices.filter((choice) => choice === 'fileA').length;
+  const second = state.choices.length - first;
+  const firstName = filename(state.fileA);
+  const secondName = filename(state.fileB);
+  const winner = first === second ? 'It’s a tie' : `${first > second ? firstName : secondName} wins`;
+  const winnerCount = Math.max(first, second);
+  const roundLabel = `${state.choices.length} round${state.choices.length === 1 ? '' : 's'}`;
   return `<main class="page results-page">
-    <div class="results-heading"><div class="eyebrow">TEST COMPLETE</div><h1>${winner} <span class="winner-spark">✦</span></h1><p>You made ${state.choices.length} preference choices. Here is the breakdown.</p></div>
+    <div class="results-heading"><div class="eyebrow">TEST COMPLETE</div><h1>${escapeHtml(winner)} <span class="winner-spark">✦</span></h1><p>The sample labels changed between rounds to keep the comparison blind.</p></div>
     <section class="result-card">
-      <div class="result-top"><span class="result-label">YOUR PREFERENCE</span><span class="result-rounds">${state.choices.length} rounds</span></div>
+      <div class="result-top"><span class="result-label">YOUR PREFERENCE</span><span class="result-rounds">${roundLabel}</span></div>
       <div class="result-bars">
-        <div class="result-side"><div class="result-number">${a}</div><div class="result-side-label">Sample A</div></div>
-        <div class="bar-track"><div class="bar-fill a-fill" style="width:${state.choices.length ? (a / state.choices.length) * 100 : 50}%"></div><div class="bar-fill b-fill" style="width:${state.choices.length ? (b / state.choices.length) * 100 : 50}%"></div></div>
-        <div class="result-side right"><div class="result-number">${b}</div><div class="result-side-label">Sample B</div></div>
+        <div class="result-side"><div class="result-number">${first}</div><div class="result-side-label" title="${escapeHtml(state.fileA)}">${escapeHtml(firstName)}</div></div>
+        <div class="bar-track"><div class="bar-fill a-fill" style="width:${state.choices.length ? (first / state.choices.length) * 100 : 50}%"></div><div class="bar-fill b-fill" style="width:${state.choices.length ? (second / state.choices.length) * 100 : 50}%"></div></div>
+        <div class="result-side right"><div class="result-number">${second}</div><div class="result-side-label" title="${escapeHtml(state.fileB)}">${escapeHtml(secondName)}</div></div>
       </div>
-      <div class="result-percentages"><span>${state.choices.length ? Math.round(a / state.choices.length * 100) : 50}%</span><span>${state.choices.length ? Math.round(b / state.choices.length * 100) : 50}%</span></div>
+      <div class="result-percentages"><span>${state.choices.length ? Math.round(first / state.choices.length * 100) : 50}%</span><span>${state.choices.length ? Math.round(second / state.choices.length * 100) : 50}%</span></div>
     </section>
-    <div class="confidence-note"><span class="confidence-icon">${icon('check')}</span><div><strong>${a === b ? 'No clear preference yet.' : `${winnerCount} of ${state.choices.length} rounds leaned this way.`}</strong><br /><span>${a === b ? 'Try a few more rounds if you want a stronger signal.' : 'A consistent choice is a useful signal, but trust your ears.'}</span></div></div>
-    <div class="results-actions"><button class="button secondary" id="new-test">${icon('refresh')} New test</button><button class="button primary" id="run-again">Run these files again ${icon('arrow')}</button></div>
+    <div class="confidence-note"><span class="confidence-icon">${icon('check')}</span><div><strong>${first === second ? 'No clear preference yet.' : `${winnerCount} of ${roundLabel} preferred this version.`}</strong><br /><span>${first === second ? 'Try another run with fresh excerpts.' : 'The test sampled synchronized sections from across both tracks.'}</span></div></div>
+    <div class="results-actions"><button class="button secondary" id="new-test">${icon('refresh')} New files</button><button class="button primary" id="run-again">Try new excerpts ${icon('arrow')}</button></div>
   </main>`;
 }
 
@@ -251,58 +292,161 @@ async function bindFileDrops() {
   });
 }
 
-async function togglePlayback(letter) {
-  const path = letter === 'A' ? state.fileA : state.fileB;
-  if (!path) return;
+function randomUnit() {
+  const value = new Uint32Array(1);
+  crypto.getRandomValues(value);
+  return value[0] / 0x100000000;
+}
+
+function shuffled(values) {
+  const result = [...values];
+  for (let index = result.length - 1; index > 0; index -= 1) {
+    const target = Math.floor(randomUnit() * (index + 1));
+    [result[index], result[target]] = [result[target], result[index]];
+  }
+  return result;
+}
+
+function createRounds(duration, count) {
+  const length = Math.min(EXCERPT_SECONDS, duration);
+  const latestStart = Math.max(0, duration - length);
+  const starts = latestStart === 0
+    ? Array(count).fill(0)
+    : Array.from({ length: count }, (_, index) => (
+      ((index + randomUnit()) / count) * latestStart
+    ));
+  let mappings = Array.from({ length: count }, (_, index) => index % 2 === 0);
+  if (randomUnit() > 0.5) mappings = mappings.map((value) => !value);
+  mappings = shuffled(mappings);
+  return shuffled(starts).map((start, index) => ({
+    start,
+    length,
+    swapped: mappings[index],
+  }));
+}
+
+function clearPlaybackTimer() {
+  if (playbackTimer !== null) {
+    clearTimeout(playbackTimer);
+    playbackTimer = null;
+  }
+}
+
+function syncedOffset() {
+  if (!state.playing || state.playbackStartedAt === null) return state.playbackOffset;
+  return Math.min(
+    currentRound().length,
+    state.playbackOffset + (performance.now() - state.playbackStartedAt) / 1000,
+  );
+}
+
+function resetPlaybackPosition() {
+  clearPlaybackTimer();
+  state.playing = null;
+  state.playbackOffset = 0;
+  state.playbackStartedAt = null;
+}
+
+function beginTest() {
+  state.rounds = createRounds(state.commonDuration, state.trials);
+  state.currentTrial = 0;
+  state.choices = [];
+  state.heard = [];
   state.error = '';
+  state.revealOnNextChoice = false;
+  resetPlaybackPosition();
+  state.screen = 'test';
+  render();
+}
+
+async function togglePlayback(letter) {
+  const round = currentRound();
+  const source = sourceForLetter(round, letter);
+  const path = state[source];
+  if (!path) return;
+
+  state.error = '';
+  const offset = syncedOffset();
   if (state.playing === letter) {
-    await invoke('stop_playback');
+    await invoke('stop_playback').catch(() => {});
+    clearPlaybackTimer();
     state.playing = null;
+    state.playbackOffset = offset;
+    state.playbackStartedAt = null;
     render();
     return;
   }
+
+  const nextOffset = round.length - offset < 0.15 ? 0 : offset;
+  const remaining = round.length - nextOffset;
   try {
     await invoke('start_playback', {
       path,
       volume: state.volume,
       replayGain: state.replayGain,
       albumGain: state.albumGain,
+      startAt: round.start + nextOffset,
+      playFor: remaining,
       customPath: state.ffplayPath || null,
     });
+    clearPlaybackTimer();
     state.playing = letter;
+    state.playbackOffset = nextOffset;
+    state.playbackStartedAt = performance.now();
+    if (!state.heard.includes(letter)) state.heard.push(letter);
+    playbackTimer = window.setTimeout(() => {
+      if (state.screen !== 'test') return;
+      resetPlaybackPosition();
+      render();
+    }, (remaining + 0.2) * 1000);
     render();
   } catch (error) {
-    state.playing = null;
+    resetPlaybackPosition();
     state.error = String(error);
     render();
   }
 }
 
 async function choosePreference(choice) {
+  if (!state.heard.includes('A') || !state.heard.includes('B')) return;
   await invoke('stop_playback').catch(() => {});
-  state.playing = null;
-  state.choices.push(choice);
-  if (state.choices.length >= state.trials) {
+  clearPlaybackTimer();
+  state.choices.push(sourceForLetter(currentRound(), choice));
+  resetPlaybackPosition();
+  if (state.revealOnNextChoice || state.choices.length >= state.trials) {
+    state.revealOnNextChoice = false;
     state.screen = 'results';
   } else {
     state.currentTrial += 1;
+    state.heard = [];
   }
   render();
 }
 
-function startTest() {
-  if (!state.fileA || !state.fileB) return;
+async function startTest() {
+  if (!state.fileA || !state.fileB || state.preparing) return;
   if (!state.ffplay.available) {
-    state.error = 'FFplay was not found. Install FFmpeg or set its executable path in Playback settings.';
+    state.error = 'FFplay was not found. Install FFmpeg or set its executable path in Settings.';
     render();
     return;
   }
+
   state.error = '';
-  state.currentTrial = 0;
-  state.choices = [];
-  state.playing = null;
-  state.screen = 'test';
+  state.preparing = true;
   render();
+  try {
+    const [firstDuration, secondDuration] = await Promise.all([
+      invoke('audio_duration', { path: state.fileA, customPath: state.ffplayPath || null }),
+      invoke('audio_duration', { path: state.fileB, customPath: state.ffplayPath || null }),
+    ]);
+    state.commonDuration = Math.min(firstDuration, secondDuration);
+    state.preparing = false;
+    beginTest();
+  } catch (error) {
+    state.preparing = false;
+    state.error = String(error);
+    render();
+  }
 }
 
 function bindEvents() {
@@ -310,12 +454,21 @@ function bindEvents() {
   document.querySelector('#start-test')?.addEventListener('click', startTest);
   document.querySelectorAll('[data-play]').forEach((button) => button.addEventListener('click', () => togglePlayback(button.dataset.play)));
   document.querySelectorAll('[data-choice]').forEach((button) => button.addEventListener('click', () => choosePreference(button.dataset.choice)));
+  document.querySelector('#reveal-next-choice')?.addEventListener('click', () => {
+    state.revealOnNextChoice = !state.revealOnNextChoice;
+    render();
+  });
   document.querySelector('#new-test')?.addEventListener('click', () => {
-    state.screen = 'setup'; state.choices = []; state.currentTrial = 0; render();
+    state.screen = 'setup';
+    state.rounds = [];
+    state.choices = [];
+    state.currentTrial = 0;
+    state.heard = [];
+    state.revealOnNextChoice = false;
+    resetPlaybackPosition();
+    render();
   });
-  document.querySelector('#run-again')?.addEventListener('click', () => {
-    state.screen = 'test'; state.choices = []; state.currentTrial = 0; state.error = ''; render();
-  });
+  document.querySelector('#run-again')?.addEventListener('click', beginTest);
   document.querySelector('#trials')?.addEventListener('input', (event) => {
     state.trials = Number(event.target.value);
     event.target.style.setProperty('--fill', `${(state.trials - 1) / 19 * 100}%`);
@@ -347,4 +500,7 @@ function bindEvents() {
 render();
 checkFfplay();
 bindFileDrops().catch(() => {});
-window.addEventListener('beforeunload', () => invoke('stop_playback').catch(() => {}));
+window.addEventListener('beforeunload', () => {
+  clearPlaybackTimer();
+  invoke('stop_playback').catch(() => {});
+});
