@@ -56,6 +56,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Cache Rust dependencies and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: ${{ matrix.target }}
+
       - name: Install Linux system dependencies
         if: matrix.runner == 'ubuntu-22.04'
         run: |
