@@ -32,6 +32,7 @@ const state = {
 
 const app = document.querySelector('#app');
 let playbackTimer = null;
+let progressFrame = null;
 
 function filename(path) {
   return path?.split(/[\\/]/).pop() || 'Choose a music file';
@@ -83,7 +84,7 @@ function fileCard(slot, path, label) {
     <span class="file-placeholder ${path ? 'has-file' : ''}">
       <span class="upload-icon">${path ? icon('check') : icon('folder')}</span>
       <span class="file-name" ${path ? `title="${escapeHtml(path)}"` : ''}>${path ? escapeHtml(name) : 'Drop a file here'}</span>
-      <span class="file-path">${path ? 'Click to replace' : 'or click to choose'}</span>
+      <span class="file-path" ${path ? `title="${escapeHtml(path)}"` : ''}>${path ? escapeHtml(path) : 'or click to choose'}</span>
     </span>
   </button>`;
 }
@@ -180,6 +181,11 @@ function testingScreen() {
     </div>
     ${state.error ? `<div class="error-banner">${escapeHtml(state.error)}</div>` : ''}
     <div class="excerpt-note"><strong>Synced excerpt</strong><span>${formatTime(round.start)}–${formatTime(round.start + round.length)}</span><small>New section each round</small></div>
+    <div class="playback-progress">
+      <span id="progress-current">${formatTime(round.start + state.playbackOffset)}</span>
+      <input id="playback-progress" type="range" min="0" max="${round.length}" step="0.01" value="${state.playbackOffset}" style="--fill:${state.playbackOffset / round.length * 100}%" aria-label="Playback position within the synced excerpt" />
+      <span>${formatTime(round.start + round.length)}</span>
+    </div>
     <div class="players">${playerCard('A')}${playerCard('B')}</div>
     <div class="test-divider"><span>${canChoose ? 'YOUR PREFERENCE' : 'LISTEN TO BOTH TO CHOOSE'}</span></div>
     <div class="preference-row">
@@ -197,9 +203,7 @@ function testingScreen() {
 function resultsScreen() {
   const first = state.choices.filter((choice) => choice === 'fileA').length;
   const second = state.choices.length - first;
-  const firstName = filename(state.fileA);
-  const secondName = filename(state.fileB);
-  const winner = first === second ? 'It’s a tie' : `${first > second ? firstName : secondName} wins`;
+  const winner = first === second ? 'It’s a tie' : `Version ${first > second ? '1' : '2'} wins`;
   const winnerCount = Math.max(first, second);
   const roundLabel = `${state.choices.length} round${state.choices.length === 1 ? '' : 's'}`;
   return `<main class="page results-page">
@@ -207,9 +211,9 @@ function resultsScreen() {
     <section class="result-card">
       <div class="result-top"><span class="result-label">YOUR PREFERENCE</span><span class="result-rounds">${roundLabel}</span></div>
       <div class="result-bars">
-        <div class="result-side"><div class="result-number">${first}</div><div class="result-side-label" title="${escapeHtml(state.fileA)}">${escapeHtml(firstName)}</div></div>
+        <div class="result-side"><div class="result-number">${first}</div><div class="result-source-tag">VERSION 1</div><div class="result-side-label" title="${escapeHtml(state.fileA)}">${escapeHtml(state.fileA)}</div></div>
         <div class="bar-track"><div class="bar-fill a-fill" style="width:${state.choices.length ? (first / state.choices.length) * 100 : 50}%"></div><div class="bar-fill b-fill" style="width:${state.choices.length ? (second / state.choices.length) * 100 : 50}%"></div></div>
-        <div class="result-side right"><div class="result-number">${second}</div><div class="result-side-label" title="${escapeHtml(state.fileB)}">${escapeHtml(secondName)}</div></div>
+        <div class="result-side right"><div class="result-number">${second}</div><div class="result-source-tag">VERSION 2</div><div class="result-side-label" title="${escapeHtml(state.fileB)}">${escapeHtml(state.fileB)}</div></div>
       </div>
       <div class="result-percentages"><span>${state.choices.length ? Math.round(first / state.choices.length * 100) : 50}%</span><span>${state.choices.length ? Math.round(second / state.choices.length * 100) : 50}%</span></div>
     </section>
@@ -219,8 +223,13 @@ function resultsScreen() {
 }
 
 function render() {
+  if (progressFrame !== null) {
+    cancelAnimationFrame(progressFrame);
+    progressFrame = null;
+  }
   app.innerHTML = `${header()}${state.screen === 'setup' ? setupScreen() : state.screen === 'test' ? testingScreen() : resultsScreen()}`;
   bindEvents();
+  refreshProgressDisplay();
 }
 
 async function checkFfplay() {
@@ -340,6 +349,25 @@ function syncedOffset() {
   );
 }
 
+function updateProgressDisplay(offset) {
+  const progress = document.querySelector('#playback-progress');
+  const current = document.querySelector('#progress-current');
+  if (!progress || !current || state.screen !== 'test') return;
+  const round = currentRound();
+  const boundedOffset = Math.min(round.length, Math.max(0, offset));
+  progress.value = String(boundedOffset);
+  progress.style.setProperty('--fill', `${boundedOffset / round.length * 100}%`);
+  progress.setAttribute('aria-valuetext', `${formatTime(round.start + boundedOffset)} of ${formatTime(round.start + round.length)}`);
+  current.textContent = formatTime(round.start + boundedOffset);
+}
+
+function refreshProgressDisplay() {
+  if (state.screen !== 'test') return;
+  const progress = document.querySelector('#playback-progress');
+  if (document.activeElement !== progress) updateProgressDisplay(syncedOffset());
+  if (state.playing) progressFrame = requestAnimationFrame(refreshProgressDisplay);
+}
+
 function resetPlaybackPosition() {
   clearPlaybackTimer();
   state.playing = null;
@@ -359,12 +387,34 @@ function beginTest() {
   render();
 }
 
-async function togglePlayback(letter) {
+async function startSamplePlayback(letter, offset) {
   const round = currentRound();
-  const source = sourceForLetter(round, letter);
-  const path = state[source];
+  const path = state[sourceForLetter(round, letter)];
   if (!path) return;
+  const remaining = round.length - offset;
+  await invoke('start_playback', {
+    path,
+    volume: state.volume,
+    replayGain: state.replayGain,
+    albumGain: state.albumGain,
+    startAt: round.start + offset,
+    playFor: remaining,
+    customPath: state.ffplayPath || null,
+  });
+  clearPlaybackTimer();
+  state.playing = letter;
+  state.playbackOffset = offset;
+  state.playbackStartedAt = performance.now();
+  if (!state.heard.includes(letter)) state.heard.push(letter);
+  playbackTimer = window.setTimeout(() => {
+    if (state.screen !== 'test') return;
+    resetPlaybackPosition();
+    render();
+  }, (remaining + 0.2) * 1000);
+  render();
+}
 
+async function togglePlayback(letter) {
   state.error = '';
   const offset = syncedOffset();
   if (state.playing === letter) {
@@ -377,29 +427,32 @@ async function togglePlayback(letter) {
     return;
   }
 
-  const nextOffset = round.length - offset < 0.15 ? 0 : offset;
-  const remaining = round.length - nextOffset;
+  const nextOffset = currentRound().length - offset < 0.15 ? 0 : offset;
   try {
-    await invoke('start_playback', {
-      path,
-      volume: state.volume,
-      replayGain: state.replayGain,
-      albumGain: state.albumGain,
-      startAt: round.start + nextOffset,
-      playFor: remaining,
-      customPath: state.ffplayPath || null,
-    });
-    clearPlaybackTimer();
-    state.playing = letter;
-    state.playbackOffset = nextOffset;
-    state.playbackStartedAt = performance.now();
-    if (!state.heard.includes(letter)) state.heard.push(letter);
-    playbackTimer = window.setTimeout(() => {
-      if (state.screen !== 'test') return;
-      resetPlaybackPosition();
-      render();
-    }, (remaining + 0.2) * 1000);
+    await startSamplePlayback(letter, nextOffset);
+  } catch (error) {
+    resetPlaybackPosition();
+    state.error = String(error);
     render();
+  }
+}
+
+async function seekPlayback(rawOffset) {
+  const round = currentRound();
+  const offset = Math.min(Math.max(0, Number(rawOffset)), Math.max(0, round.length - 0.05));
+  const activeSample = state.playing;
+  if (activeSample) await invoke('stop_playback').catch(() => {});
+  clearPlaybackTimer();
+  state.playing = null;
+  state.playbackOffset = offset;
+  state.playbackStartedAt = null;
+  if (!activeSample) {
+    render();
+    return;
+  }
+
+  try {
+    await startSamplePlayback(activeSample, offset);
   } catch (error) {
     resetPlaybackPosition();
     state.error = String(error);
@@ -453,6 +506,14 @@ function bindEvents() {
   document.querySelectorAll('.file-drop').forEach((button) => button.addEventListener('click', () => chooseFile(button.dataset.slot)));
   document.querySelector('#start-test')?.addEventListener('click', startTest);
   document.querySelectorAll('[data-play]').forEach((button) => button.addEventListener('click', () => togglePlayback(button.dataset.play)));
+  document.querySelector('#playback-progress')?.addEventListener('input', (event) => {
+    updateProgressDisplay(Number(event.currentTarget.value));
+  });
+  document.querySelector('#playback-progress')?.addEventListener('change', (event) => {
+    const offset = Number(event.currentTarget.value);
+    event.currentTarget.blur();
+    seekPlayback(offset);
+  });
   document.querySelectorAll('[data-choice]').forEach((button) => button.addEventListener('click', () => choosePreference(button.dataset.choice)));
   document.querySelector('#reveal-next-choice')?.addEventListener('click', () => {
     state.revealOnNextChoice = !state.revealOnNextChoice;
